@@ -1,66 +1,99 @@
-from datetime import datetime, timedelta
 import logging
-from api import utils
+import secrets
+from datetime import datetime, timedelta
+
+from api.db_connection import DatabaseManager
 from api.telegram_service import TelegramService
 
 WATER_PUMP_MIC_MIN_THRESHOLD = 100
 TANK_MIN_MIC_THRESHOLD = 200
 
 
-class WaterPumpService:
+class WaterPumpService(DatabaseManager):
     def __init__(self, notification_service: TelegramService = None):
+        super().__init__()
         self.current_status = None
+        self.current_pump_status = None
         self.history = []
         self.notification_service = notification_service
-        self.load_data()
+        self.load_telemetry_data()
+        self.load_pump_status()
 
-    def load_data(self):
-        # Load the JSON file data, limiting to the most recent 100 items
-
-        self.history: list = utils.get_current_water_pump_status()
-        if self.history:
-            # Load the latest entry as the current status
-            self.current_status = self.history[-1]
-        else:
-            # Initialize default status if no history is found
-            self.current_status = self.default_status()
-            self.history.append(self.current_status)
+    def load_telemetry_data(self):
+        latest_metric = """
+        SELECT * FROM pump_telemetry p order by p.created_at DESC LIMIT 1
+        """
+        result = self.fetch_one(latest_metric)
+        self.current_status = dict(result) if result is not None else self.default_telemetry_data()
 
         logging.info("Data loaded from json file ...")
 
-    def save_data(self):
-        # Add the current status to history, limit to last 100 entries, then save
-        self.history.append(self.current_status)
-        self.history = self.history[-100:]  # Limit to last 100 items
+    def save_telemetry_data(self):
+        now = datetime.now()
+        unique_id = secrets.token_hex(8)
+        query = '''
+                INSERT INTO pump_telemetry 
+                    (
+                    id, 
+                    water_pump_microphone_value, 
+                    water_tank_microphone_value, 
+                    created_at,
+                    water_pump_status, 
+                    water_tank_status
+                    )
+                VALUES (?, ?, ?, ?, ?, ?)
+                '''
 
-        utils.save_current_water_pump_status(self.history)
+        self.execute_query(query, (
+            unique_id,
+            self.current_status['water_pump_microphone_value'],
+            self.current_status['water_tank_microphone_value'],
+            now,
+            self.current_status["water_pump_status"],
+            self.current_status["water_tank_status"]))
+        # utils.save_current_water_pump_status(self.history)
 
         logging.info("Data saved to json file ...")
 
-    def default_status(self):
+    def save_pump_status(self, water_pump_enabled: bool = None):
+        if self.current_pump_status.get('enabled', False) != water_pump_enabled:
+            now = datetime.now()
+            unique_id = secrets.token_hex(8)
+            insert_query = """
+            
+            INSERT INTO pump_status(unique_id, enabled, created_at) values (?,?,?)
+            """
+            self.execute_query(insert_query, (unique_id, water_pump_enabled, now))
+            self.load_pump_status()
+
+    def load_pump_status(self):
+        latest_pump_status_query = """
+        SELECT * FROM pump_status p order by p.created_at DESC LIMIT 1
+        """
+        result = self.fetch_one(latest_pump_status_query)
+        self.current_pump_status = dict(result) if result is not None else {}
+
+    def default_telemetry_data(self):
         # Default values for a new status
         now = datetime.now()
         return {
             "created_at": now,
-            "updated_at": now,
-            "is_overridden": False,
-            "water_pump_microphone_status": True,
-            "water_pump_microphone_value": 0,
-            "tank_microphone_status": True,
-            "tank_microphone_value": 0,
             "water_pump_status": False,
-            "last_checked_at": now,
-            "current_metric_date": now,
-            "previous_metric_date": now,
+            "water_pump_microphone_value": 0,
+            "water_tank_status": False,
+            "water_tank_microphone_value": 0
         }
 
     def are_sensors_valid(self):
-        return self.current_status["water_pump_microphone_status"] and self.current_status["tank_microphone_status"]
+        return self.current_status["water_pump_status"] and self.current_status["water_tank_status"]
 
     def is_overridden(self):
-        should_turn_on_at = self.current_status.get("should_turn_on_at", None)
-        should_turn_off_at = self.current_status.get("should_turn_off_at", None)
-        return ((should_turn_on_at is not None and should_turn_off_at is not None)
+        should_turn_on_at = self.current_pump_status.get("turn_on_at", None)
+        should_turn_off_at = self.current_pump_status.get("turn_off_at", None)
+        is_overridden = self.current_pump_status.get("is_overridden", False)
+        return (is_overridden
+                and
+                (should_turn_on_at is not None and should_turn_off_at is not None)
                 and
                 (should_turn_on_at <= datetime.now() < should_turn_off_at))
 
@@ -70,23 +103,18 @@ class WaterPumpService:
             self.notification_service.notify_water_pump_without_water_flow()
         return water_pump_status
 
-    def update_metrics(self, water_pump_microphone_value, tank_microphone_value):
-        # Update metrics, calculate if pump should be on/off
-        now = datetime.now()
-        self.current_status["previous_metric_date"] = self.current_status["current_metric_date"]
-        self.current_status["current_metric_date"] = now
+    def save_telemetry(self, water_pump_microphone_value, tank_microphone_value):
         self.current_status["water_pump_microphone_value"] = water_pump_microphone_value
-        self.current_status["tank_microphone_value"] = tank_microphone_value
-        self.current_status["updated_at"] = now
-        self.current_status["last_checked_at"] = now
+        self.current_status["water_tank_microphone_value"] = tank_microphone_value
 
         # Check microphone status based on value (e.g., if value is above 0, assume it's "on")
-        self.current_status["water_pump_microphone_status"] = water_pump_microphone_value > WATER_PUMP_MIC_MIN_THRESHOLD
-        self.current_status["tank_microphone_status"] = tank_microphone_value > TANK_MIN_MIC_THRESHOLD
+        self.current_status["water_pump_status"] = water_pump_microphone_value > WATER_PUMP_MIC_MIN_THRESHOLD
+        self.current_status["water_tank_status"] = tank_microphone_value > TANK_MIN_MIC_THRESHOLD
 
         self.current_status["water_pump_status"] = self.determine_water_pump_status()
 
-        self.save_data()  # Save to JSON after updating
+        self.save_telemetry_data()
+        self.save_pump_status(bool(self.current_status.get("water_pump_status", False)))
 
     def override_pump(self, status: bool, turn_off_at_minutes: int = None):
         # Manually override the pump status
@@ -100,7 +128,7 @@ class WaterPumpService:
         if status and turn_off_at_minutes:
             self.current_status["should_turn_off_at"] = future_date
 
-        self.save_data()
+        self.save_telemetry_data()
         self.notification_service.water_pump_has_been_overridden({
             'now': now,
             'should_turn_off_at': future_date,
@@ -108,9 +136,7 @@ class WaterPumpService:
         })
 
     def reset_override(self):
-        # Reset the override to allow normal operation
-        self.current_status["is_overridden"] = False
-        self.save_data()
+        pass
 
     def get_status(self):
         # Returns the current status dictionary
@@ -120,4 +146,4 @@ class WaterPumpService:
         """
         This method will return 1  water is flowing as expected keeping the water pump on, 0 otherwise
         """
-        return 1 if self.current_status["water_pump_status"] else 0
+        return 1 if self.current_pump_status.get("enabled", 0) else 0

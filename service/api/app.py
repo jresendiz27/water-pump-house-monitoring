@@ -28,8 +28,7 @@ def health():
 
 @app.route("/water-pump/status", methods=['GET'])
 def water_pump_status():
-    current_status = WaterPumpService().current_status()
-    return jsonify(current_status), 200
+    return jsonify(WaterPumpService().current_status), 200
 
 
 @app.route("/water-pump/override", methods=['POST'])
@@ -56,7 +55,7 @@ def water_pump_action():
 
     water_pump_service = WaterPumpService(notification_service)
 
-    water_pump_service.update_metrics(water_microphone, tank_microphone)
+    water_pump_service.save_telemetry(water_microphone, tank_microphone)
 
     resolved_action = water_pump_service.resolve_action()
 
